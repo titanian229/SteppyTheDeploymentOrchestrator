@@ -7,3 +7,6 @@ node_modules
 .cdk.staging
 cdk.out
 input.json
+
+# Ignoring my bin folder to avoid leaking my secrets
+bin
