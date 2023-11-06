@@ -6,7 +6,6 @@ import {
   aws_iam as iam,
   aws_logs as logs,
   aws_lambda as lambda,
-  aws_apigateway as apigateway,
   aws_ssm as ssm,
   aws_s3 as s3,
 } from "aws-cdk-lib";
@@ -41,7 +40,6 @@ export class DeploymentOrchestrator extends cdk.Stack {
       stageName,
       snsNotificationTopicName,
       environmentName,
-      // targetAWSAccountNumber,
       codeBuildArns,
       tags,
       env,
@@ -53,12 +51,12 @@ export class DeploymentOrchestrator extends cdk.Stack {
 
     // Input S3 bucket
     const inputBucket = new s3.Bucket(this, `s3-${applicationName.toLowerCase()}inputbucket`, {
-      // autoDeleteObjects: true,
       // Private
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       bucketName: `s3-${applicationName.toLowerCase()}inputbucket-${stackSuffix}`,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       // TODO: Each input file kept for posterity, or replaced and the sheet name specified?
+      // autoDeleteObjects: true,
       // lifecycleRules: [ // { // expiration: cdk.Duration.days(7), // }, // ],
     });
 
@@ -80,21 +78,16 @@ export class DeploymentOrchestrator extends cdk.Stack {
 
     // Lambda that loops on steps and starts each step, this could also be a Map with a single execution allowed but this allows for a little extra fanciness
     const steppyLambda = new lambda.Function(this, `lambda-${applicationName}steppy`, {
-      // environment: {
-      // MONGODB_URI: mongoDBURI,
-      // ENVIRONMENT: environmentName,
-      // DATA_BUCKET_NAME: s3Bucket.bucketName,
-      // },
       code: lambda.Code.fromAsset("src/lambda/steppy", { exclude: ["test/*", "*.ts", "*.js.map", "*.d.ts"] }),
       functionName: `lambda-${applicationName}Steppy-${stackSuffix}`,
       description: "Part of DeploymentOrchestrator, steppy runs through deployment steps",
-      // role: lambdaS3AccessRole,
       ...sharedLambdaProps,
     });
 
     // TODO: SNS topic that runs this?
 
     // Getting the human confirmation stack's APIGW endpoint
+    // TODO: Move this to a nested stack
     const humanConfirmationAPIGWEndpoint = ssm.StringParameter.valueForStringParameter(
       this,
       `/${applicationName}/${stageName}/humanConfirmationApiUrl`
@@ -165,17 +158,6 @@ export class DeploymentOrchestrator extends cdk.Stack {
       iamResources: [inputBucket.arnForObjects("*")],
     });
 
-    // // Convert input to JSON task using pass, pending Lambda for parsing and validation
-    // const convertInputTask = new sfn.Pass(this, `task-${applicationName}ConvertInput`, {
-    //   resultPath: "$.input",
-    //   // Convert JSON string to object using StringToJson
-
-    //   // parameters: { input: sfn.JsonPath.stringAt("$.input.Body") },
-    //   // Output stages
-    //   result: sfn.Result.fromObject({ stages: sfn.JsonPath.objectAt("$.input.Body") }),
-    //   // result: sfn.Result.fromObject({ stages: sfn.JsonPath.stringToJson(sfn.JsonPath.stringAt("$.input.Body")) }),
-    // });
-
     // Convert input to JSON task using Lambda for parsing and validation
     const convertInputTask = new tasks.LambdaInvoke(this, "ConvertInputTask", {
       lambdaFunction: new lambda.Function(this, `lambda-${applicationName}ConvertInput`, {
@@ -216,18 +198,6 @@ export class DeploymentOrchestrator extends cdk.Stack {
       iamResources: [snsNotificationTopicArn],
       resultPath: sfn.JsonPath.DISCARD,
     });
-
-    // Pass function to set iterator's initial state
-    // const setIteratorInitialState = new sfn.Pass(this, `task-${applicationName}SetIteratorInitialState`, {
-    //   resultPath: "$.iterator",
-    //   result: sfn.Result.fromObject({
-    //     // Current stage
-    //     // Starting at -1 because the first increment will bring it to 0
-    //     index: 0,
-    //     // Total number of stages
-    //     count: sfn.JsonPath.stringAt("$.input.stages.length()"),
-    //   }),
-    // });
 
     // // From here, the start of the actual stepper
     // // Comprised of stages with steps, stages are one linearly, all steps in a stage are run at the same time
@@ -270,7 +240,9 @@ export class DeploymentOrchestrator extends cdk.Stack {
       comment:
         "Steppy the steppin' Lambda, determines what stage the deployment is currently in and increments until complete",
       payload: sfn.TaskInput.fromObject({
+        // Iterator stores the current stage and step, and increment values
         iterator: sfn.JsonPath.objectAt("$.iterator"),
+        // Stages are the stages of the deployment
         stages: sfn.JsonPath.stringAt("$.stages"),
         // results of last iteration through map, used to stop if there were failures that should cause a stop, like a CodeBuild
         iteratorResults: sfn.JsonPath.stringAt("$.iteratorResults"),
@@ -280,6 +252,7 @@ export class DeploymentOrchestrator extends cdk.Stack {
         index: sfn.JsonPath.stringAt("$.Payload.index"),
         count: sfn.JsonPath.stringAt("$.Payload.count"),
         continue: sfn.JsonPath.stringAt("$.Payload.continue"),
+        // The current stages steps to be passed to the Map task
         currentStageSteps: sfn.JsonPath.stringAt("$.Payload.currentStageSteps"),
       },
     });
@@ -356,12 +329,6 @@ export class DeploymentOrchestrator extends cdk.Stack {
     // Map on steps in stage
     const mapOnStepsInStage = new sfn.Map(this, "MapOnStepsInStage", {
       itemsPath: sfn.JsonPath.stringAt("$.iterator.currentStageSteps.steps"),
-      // itemsPath: sfn.JsonPath.arrayGetItem("$.input.stages", sfn.JsonPath.numberAt("$.iterator.index")),
-      // itemsPath: sfn.JsonPath.arrayGetItem(
-      //   sfn.JsonPath.array("$.input.stages"),
-      //   sfn.JsonPath.numberAt("$.iterator.index")
-      // ),
-      // itemsPath: sfn.JsonPath.arrayGetItemstringAt("States.ArrayGetItem($.input.stages, $.iterator.index).steps"),
       resultPath: "$.iteratorResults",
     }).iterator(
       new sfn.Choice(this, "StepChoice", {
@@ -381,7 +348,7 @@ export class DeploymentOrchestrator extends cdk.Stack {
               // EnvironmentVariablesOverride: sfn.JsonPath.stringAt("$.value.environmentVariableOverrides"),
               SourceVersion: sfn.JsonPath.stringAt("$.sourceVersion"),
             },
-
+            // This is used to grant the SFN permission to call the CodeBuilds
             iamResources: [...codeBuildArns],
             resultPath: "$.CodeBuildResults",
           }).next(waitForCodeBuild.next(checkCodeBuildComplete.next(codeBuildCompleteChoice)))
@@ -414,17 +381,7 @@ export class DeploymentOrchestrator extends cdk.Stack {
         //   })
         // )
         // For Human step, publish the task token to an SNS topic then wait for a response
-        .when(
-          sfn.Condition.stringEquals("$.type", "Human"),
-          humanConfirmationTask
-          // new tasks.CallAwsService(this, `task-${applicationName}Notify`, {
-          //   service: "SNS",
-          //   action: "publish",
-          //   integrationPattern: sfn.IntegrationPattern.WAIT_FOR_TASK_TOKEN,
-          //   parameters: { TopicArn: snsNotificationTopicArn, Message: sfn.JsonPath.stringAt("$.message"),  },
-          //   iamResources: [snsNotificationTopicArn],
-          // })
-        )
+        .when(sfn.Condition.stringEquals("$.type", "Human"), humanConfirmationTask)
         // Notification step, send a notification to an SNS topic
         .when(
           sfn.Condition.stringEquals("$.type", "Notify"),
@@ -439,20 +396,10 @@ export class DeploymentOrchestrator extends cdk.Stack {
         .when(
           sfn.Condition.stringEquals("$.type", "Wait"),
           new sfn.Wait(this, `task-${applicationName}Wait`, {
-            // time: sfn.WaitTime.duration(cdk.Duration.seconds(10)),
             // Wait a time passed in on time
             time: sfn.WaitTime.secondsPath("$.seconds"),
           })
         )
-      // Test step, start a CodeBuild and continue without waiting
-      // .when(
-      //   sfn.Condition.stringEquals("$.value.type", "Wait"),
-      //   new sfn.Wait(this, `task-${applicationName}Wait`, {
-      //     // time: sfn.WaitTime.duration(cdk.Duration.seconds(10)),
-      //     // Wait a time passed in on value.time
-      //     time: sfn.WaitTime.secondsPath("$.value.seconds"),
-      //   })
-      // )
     );
 
     // Choice on if deployment has exhausted all stages or should continue, either pass steps in stage into map or move to complete
@@ -472,14 +419,10 @@ export class DeploymentOrchestrator extends cdk.Stack {
       // Send a notification that deployment is beginning
       .next(startNotificationMessageTask)
       .next(notifyTask)
-      // Set the initial state of the iterator object with the index and number of steps
-      // .next(setIteratorInitialState)
       // Pass to the Lambda that will increment the step and check if there are more steps, as well as returning this stage's steps
       .next(steppyLambdaTask)
       // From here either pass into the step iterator or complete based on the number of stages remaining
       .next(choice);
-    // Pass iterator object to steppy the steppin' Lambda, which increments the step and checks if there are more steps
-    // .next(steppyLambdaTask);
 
     const stateMachine = new sfn.StateMachine(this, `sfn-${applicationName}`, {
       definitionBody: sfn.DefinitionBody.fromChainable(stepMachineDefinition),
